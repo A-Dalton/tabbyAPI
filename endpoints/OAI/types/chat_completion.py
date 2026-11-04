@@ -109,8 +109,10 @@ class ChatCompletionRequest(CommonCompletionRequest):
         default=None,
         description=(
             "Reasoning effort hint, forwarded to the chat template as the "
-            "reasoning_effort variable. Accepted values depend on the model. "
-            "An explicit reasoning_effort in template_vars takes precedence."
+            "reasoning_effort variable. Accepted values depend on the model; "
+            '"none" turns reasoning off with enable_thinking: false if the '
+            "template rejects it. An explicit reasoning_effort in template_vars "
+            "takes precedence."
         ),
     )
     enable_thinking: Optional[bool] = Field(

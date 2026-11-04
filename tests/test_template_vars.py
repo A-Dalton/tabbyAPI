@@ -1,8 +1,18 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from fastapi import HTTPException
+
+from common import model
+from common.templating import PromptTemplate
 from endpoints.OAI.types.chat_completion import ChatCompletionRequest
-from endpoints.OAI.utils.chat_completion import PRESERVE_REASONING_VARS, resolve_template_vars
+from endpoints.OAI.utils.chat_completion import (
+    PRESERVE_REASONING_VARS,
+    _resolve_start_in_reasoning,
+    apply_chat_template,
+    resolve_template_vars,
+)
 
 
 def request(**kwargs):
@@ -165,6 +175,142 @@ class ResolveTemplateVarsTests(unittest.TestCase):
             container(force={"preserve_thinking": False}),
         )
         self.assertIs(out["preserve_thinking"], False)
+
+
+class ReasoningOffTests(unittest.TestCase):
+    """reasoning_effort "none" as enable_thinking: false, for templates rejecting "none"."""
+
+    def resolve(self, data, mc=None):
+        return resolve_template_vars(data, mc or container(), reasoning_off=True)
+
+    def test_none_turns_thinking_off(self):
+        self.assertEqual(self.resolve(request(reasoning_effort="none")), {"enable_thinking": False})
+
+    def test_none_from_any_source(self):
+        for data, mc in (
+            (request(reasoning={"effort": "none"}), None),
+            (request(template_vars={"reasoning_effort": "none"}), None),
+            (request(), container(default={"reasoning_effort": "none"})),
+            (request(), container(force={"reasoning_effort": "none"})),
+        ):
+            self.assertEqual(self.resolve(data, mc), {"enable_thinking": False})
+
+    def test_other_efforts_unchanged(self):
+        for effort in ("low", "high", "no_think"):
+            out = self.resolve(request(reasoning_effort=effort))
+            self.assertEqual(out, {"reasoning_effort": effort})
+
+    def test_only_with_reasoning_off(self):
+        out = resolve_template_vars(request(reasoning_effort="none"), container())
+        self.assertEqual(out, {"reasoning_effort": "none"})
+
+    def test_forced_effort_wins_over_none(self):
+        out = self.resolve(
+            request(reasoning_effort="none"), container(force={"reasoning_effort": "high"})
+        )
+        self.assertEqual(out, {"reasoning_effort": "high"})
+
+    def test_none_wins_over_default_enable_thinking(self):
+        out = self.resolve(
+            request(reasoning_effort="none"),
+            container(default={"enable_thinking": True, "reasoning_effort": "high"}),
+        )
+        self.assertEqual(out, {"enable_thinking": False})
+
+    def test_enable_thinking_from_the_request_kept(self):
+        for data in (
+            request(reasoning_effort="none", enable_thinking=True),
+            request(reasoning={"effort": "none", "enabled": True}),
+            request(reasoning_effort="none", template_vars={"enable_thinking": True}),
+        ):
+            self.assertEqual(self.resolve(data), {"enable_thinking": True})
+
+    def test_forced_enable_thinking_kept(self):
+        out = self.resolve(
+            request(reasoning_effort="none"), container(force={"enable_thinking": True})
+        )
+        self.assertEqual(out, {"enable_thinking": True})
+
+
+# Rejects reasoning_effort "none" and turns reasoning off with enable_thinking,
+# as DeepSeek V4's does: <think> opens the generation prompt, </think> skips it
+REJECTS_NONE = (
+    "{% if reasoning_effort is defined %}"
+    "{% if reasoning_effort not in ['low', 'high', 'max'] %}"
+    "{{ raise_exception('Invalid reasoning effort: ' ~ reasoning_effort) }}"
+    "{% endif %}[effort {{ reasoning_effort }}]{% endif %}"
+    "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>"
+    "{% if enable_thinking is defined and not enable_thinking %}</think>"
+    "{% else %}<think>{% endif %}{% endif %}"
+)
+# Takes reasoning_effort as it is, as gpt-oss's does
+ACCEPTS_NONE = (
+    "{% if reasoning_effort is defined %}Reasoning: {{ reasoning_effort }}{% endif %}"
+    "{% if enable_thinking is defined %}[thinking {{ enable_thinking }}]{% endif %}"
+    "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}"
+)
+ALWAYS_RAISES = "{{ raise_exception('Broken template') }}"
+
+
+class RejectedNoneRenderTests(unittest.IsolatedAsyncioTestCase):
+    async def render(self, template, data):
+        """The prompt, and whether start_in_reasoning: auto starts in reasoning."""
+
+        mc = SimpleNamespace(
+            prompt_template=PromptTemplate("test", template),
+            use_vision=False,
+            harmony=False,
+            muse_glimmer=False,
+            reasoning=True,
+            reasoning_start_token="<think>",
+            reasoning_end_token="</think>",
+            start_in_reasoning="auto",
+            template_vars_default={},
+            template_vars_force={},
+            get_special_tokens=lambda: {},
+            hf_model=SimpleNamespace(add_bos_token=lambda: False),
+        )
+        with patch.object(model, "container", mc):
+            prompt, _ = await apply_chat_template(data)
+            return prompt, _resolve_start_in_reasoning(prompt, data)
+
+    async def test_none_renders_without_reasoning(self):
+        data = request(reasoning_effort="none")
+        prompt, starts_in_reasoning = await self.render(REJECTS_NONE, data)
+        self.assertEqual(prompt, "<|user|>hi<|assistant|></think>")
+        self.assertFalse(starts_in_reasoning)
+        self.assertIs(data.template_vars["enable_thinking"], False)
+        self.assertNotIn("reasoning_effort", data.template_vars)
+
+    async def test_other_efforts_render_as_before(self):
+        prompt, starts_in_reasoning = await self.render(
+            REJECTS_NONE, request(reasoning_effort="high")
+        )
+        self.assertEqual(prompt, "[effort high]<|user|>hi<|assistant|><think>")
+        self.assertTrue(starts_in_reasoning)
+
+    async def test_other_rejected_efforts_still_fail(self):
+        with self.assertRaises(HTTPException) as raised:
+            await self.render(REJECTS_NONE, request(reasoning_effort="minimal"))
+        self.assertEqual(raised.exception.status_code, 400)
+
+    async def test_explicit_enable_thinking_kept(self):
+        prompt, starts_in_reasoning = await self.render(
+            REJECTS_NONE, request(reasoning_effort="none", enable_thinking=True)
+        )
+        self.assertEqual(prompt, "<|user|>hi<|assistant|><think>")
+        self.assertTrue(starts_in_reasoning)
+
+    async def test_template_accepting_none_unchanged(self):
+        data = request(reasoning_effort="none")
+        prompt, _ = await self.render(ACCEPTS_NONE, data)
+        self.assertEqual(prompt, "Reasoning: none<|user|>hi")
+
+    async def test_failing_fallback_still_fails(self):
+        with self.assertRaises(HTTPException) as raised:
+            await self.render(ALWAYS_RAISES, request(reasoning_effort="none"))
+        self.assertEqual(raised.exception.status_code, 400)
 
 
 if __name__ == "__main__":

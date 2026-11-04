@@ -371,8 +371,13 @@ def _expose_reasoning(message: dict):
 async def format_messages_with_template(
     messages: List[ChatCompletionMessage],
     existing_template_vars: Optional[dict] = None,
+    fallback_template_vars: Optional[dict] = None,
 ):
-    """Barebones function to format chat completion messages into a prompt."""
+    """
+    Barebones function to format chat completion messages into a prompt.
+    fallback_template_vars, if given, are rendered instead when the template
+    rejects existing_template_vars.
+    """
 
     template_vars = unwrap(existing_template_vars, {})
     mm_embeddings = MultimodalEmbeddingWrapper() if model.container.use_vision else None
@@ -425,7 +430,16 @@ async def format_messages_with_template(
 
     template_vars.update({"messages": message_dicts, **special_tokens_dict})
 
-    prompt = await model.container.prompt_template.render(template_vars)
+    try:
+        prompt = await model.container.prompt_template.render(template_vars)
+    except TemplateError as exc:
+        if fallback_template_vars is None:
+            raise
+
+        xlogger.debug(f"Rendering with fallback template vars after TemplateError: {exc}")
+        template_vars = {**fallback_template_vars, "messages": message_dicts, **special_tokens_dict}
+        prompt = await model.container.prompt_template.render(template_vars)
+
     return prompt, mm_embeddings, template_vars
 
 
@@ -557,13 +571,20 @@ PRESERVE_REASONING_VARS = {
 }
 
 
-def resolve_template_vars(data: ChatCompletionRequest, container) -> dict:
+def resolve_template_vars(
+    data: ChatCompletionRequest, container, reasoning_off: bool = False
+) -> dict:
     """
     Merge chat template variables from all sources. Priority, lowest to
     highest: PRESERVE_REASONING_VARS if there's reasoning to preserve, the
     model's template_vars_default, the request's reasoning object, the
     request's flat reasoning_effort/enable_thinking/verbosity fields, the
     request's template_vars, then the model's template_vars_force.
+
+    With reasoning_off, a resolved reasoning_effort of "none", OpenAI's value
+    for no reasoning, is replaced by enable_thinking: false, the way most
+    open-model templates turn reasoning off. An enable_thinking set by the
+    request or template_vars_force is kept as it is.
     """
 
     request_vars = {}
@@ -590,12 +611,19 @@ def resolve_template_vars(data: ChatCompletionRequest, container) -> dict:
     # reasoning blocks, as Qwen 3.6's and DeepSeek V4's templates do
     has_reasoning = any(message.reasoning_content for message in data.messages)
 
-    return {
+    template_vars = {
         **(PRESERVE_REASONING_VARS if has_reasoning else {}),
         **container.template_vars_default,
         **request_vars,
         **container.template_vars_force,
     }
+
+    if reasoning_off and template_vars.get("reasoning_effort") == "none":
+        del template_vars["reasoning_effort"]
+        if "enable_thinking" not in {**request_vars, **container.template_vars_force}:
+            template_vars["enable_thinking"] = False
+
+    return template_vars
 
 
 def normalize_message_roles(data: ChatCompletionRequest):
@@ -622,14 +650,27 @@ async def apply_chat_template(data: ChatCompletionRequest):
     tools = data.model_dump()["tools"]
 
     try:
-        data.template_vars = resolve_template_vars(data, model.container)
-        data.template_vars.update(
-            {
-                "add_generation_prompt": data.add_generation_prompt,
-                "tools": tools,
-                "functions": data.functions,
+        render_vars = {
+            "add_generation_prompt": data.add_generation_prompt,
+            "tools": tools,
+            "functions": data.functions,
+        }
+        resolved_vars = resolve_template_vars(data, model.container)
+
+        # Clients such as Zed send OpenAI's reasoning_effort "none" whenever
+        # they turn reasoning off, which templates such as DeepSeek V4's reject:
+        # they take enable_thinking: false instead. Translating only after such
+        # a render fails keeps "none" for every template that accepts it, which
+        # matters for one that ignores enable_thinking (as Hy3's does), and
+        # needs no per-model config.
+        fallback_vars = None
+        if resolved_vars.get("reasoning_effort") == "none":
+            fallback_vars = {
+                **resolve_template_vars(data, model.container, reasoning_off=True),
+                **render_vars,
             }
-        )
+
+        data.template_vars = {**resolved_vars, **render_vars}
 
         continued_message_text = None
         original_final_message = None
@@ -639,8 +680,11 @@ async def apply_chat_template(data: ChatCompletionRequest):
 
         continues_reasoning = _continued_field(data) == "reasoning_content"
         prompt, mm_embeddings, template_vars = await format_messages_with_template(
-            data.messages, data.template_vars
+            data.messages, data.template_vars, fallback_vars
         )
+        # The fallback, if the template rejected the resolved vars, so that
+        # rendering again for a continued reasoning block uses it too
+        data.template_vars = template_vars
 
         if continued_message_text is not None:
             if (
