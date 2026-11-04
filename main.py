@@ -150,13 +150,17 @@ def entrypoint(
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    if platform.system() == "Windows":
-        from winloop import install
-    else:
-        from uvloop import install
+    # Set loop event policy. Platforms the pyproject doesn't install uvloop on
+    # keep asyncio's default loop
+    try:
+        if platform.system() == "Windows":
+            from winloop import install
+        else:
+            from uvloop import install
 
-    # Set loop event policy
-    install()
+        install()
+    except ImportError:
+        xlogger.info("uvloop is not installed. Using the default asyncio event loop.")
 
     # Parse and override config from args
     if args is None:

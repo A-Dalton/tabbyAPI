@@ -1,4 +1,8 @@
+import importlib.util
+import platform
 from typing import Optional
+
+from common.logger import xlogger
 
 # Oldest NVIDIA compute capability ExLlamaV3's kernels run on: Turing (20 series).
 # Volta is 7.0 and lacks instructions they rely on
@@ -78,6 +82,36 @@ def torch_gpu_problem() -> Optional[str]:
         )
 
     return None
+
+
+def announce_exllamav3_source_build():
+    """
+    Say so before ExLlamaV3 is imported when it has no prebuilt extension, as on
+    ARM where the pyproject installs its universal wheel. The import then compiles
+    the extension, which takes a while on the first start (later starts reuse the
+    cached build) and needs nvcc, so a missing toolkit is reported up front.
+    """
+
+    if importlib.util.find_spec("exllamav3_ext") is not None:
+        return
+
+    xlogger.info(
+        f"ExLlamaV3 has no prebuilt extension for this platform ({platform.machine()}), "
+        "so it is compiled on first use and cached. The first start can take a while."
+    )
+
+    torch = _torch()
+    if torch_backend() != "cuda":
+        return
+
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    if CUDA_HOME is None:
+        xlogger.error(
+            f"Compiling ExLlamaV3 needs nvcc from a CUDA {torch.version.cuda.split('.')[0]}.x "
+            "toolkit, which was not found. Install the toolkit and add its bin folder to PATH "
+            "or set CUDA_HOME. See the ARM page in the wiki."
+        )
 
 
 def hardware_supports_exllamav3(gpu_device_list: list[int]):

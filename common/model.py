@@ -28,6 +28,10 @@ from common.transformers_utils import HFModel
 from common.utils import deep_merge_dicts, unwrap
 
 if dependencies.exllamav3:
+    from common.hardware import announce_exllamav3_source_build
+
+    announce_exllamav3_source_build()
+
     from backends.exllamav3.model import ExllamaV3Container
 
 # Global variables for model container

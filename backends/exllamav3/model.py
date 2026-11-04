@@ -35,7 +35,7 @@ from backends.exllamav3.sampler import (
     SS_HealedCandidates,
     SS_OnlyPath,
 )
-from backends.exllamav3.utils import exllama_supports_nccl
+from backends.exllamav3.utils import exllama_supports_cpu_kernels, exllama_supports_nccl
 from backends.exllamav3.vision import clear_image_embedding_cache, image_embedding_cache
 from common.concurrency import iterate_in_threadpool
 from common.gen_logging import (
@@ -359,6 +359,16 @@ class ExllamaV3Container:
         self.tokenizer = Tokenizer.from_config(self.config)
         self.bos_token_id = self.find_bos_token()
 
+        # CPU MoE inference runs AVX kernels that ExLlamaV3 only builds for x86
+        if (
+            unwrap(kwargs.get("cpu_moe_offload_layers"), 0)
+            or unwrap(kwargs.get("cpu_moe_split_experts"), 0)
+        ) and not exllama_supports_cpu_kernels():
+            raise ValueError(
+                "cpu_moe_offload_layers and cpu_moe_split_experts need an x86 CPU. "
+                "ExLlamaV3's CPU MoE kernels are not available on this architecture."
+            )
+
         # Set CPU offload layers
         self.config.infer_params.moe_cpu_offload = unwrap(kwargs.get("cpu_moe_offload_layers"), 0)
 
@@ -563,6 +573,19 @@ class ExllamaV3Container:
                     unsupported_message = "NCCL is not available. Falling back to native backend."
                     xlogger.warning(unsupported_message)
                     tp_backend = "native"
+
+                # The native backend reduces on the CPU with AVX code (x86 only)
+                if tp_backend == "native" and not exllama_supports_cpu_kernels():
+                    if not exllama_supports_nccl():
+                        raise ValueError(
+                            "Tensor parallelism on this CPU architecture needs the nccl "
+                            "backend, and NCCL is not available."
+                        )
+                    xlogger.warning(
+                        "The native tensor parallel backend needs an x86 CPU. "
+                        "Using the nccl backend instead."
+                    )
+                    tp_backend = "nccl"
 
                 self.tp_backend = tp_backend
 

@@ -10,7 +10,7 @@ import subprocess
 import sys
 import traceback
 from shutil import copyfile, which
-from typing import List
+from typing import List, Optional
 
 # Checks for uv installation
 has_uv = which("uv") is not None
@@ -67,6 +67,29 @@ def detect_amd_gpu_targets() -> List[str]:
     return targets
 
 
+def nvcc_cuda_major() -> Optional[int]:
+    """
+    The CUDA major version of the nvcc torch's extension builder will pick up
+    (CUDA_HOME or CUDA_PATH, then PATH, then /usr/local/cuda), or None if there
+    is none. ExLlamaV3 is compiled with it on ARM, and it has to match torch's.
+    """
+
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home:
+        nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    else:
+        nvcc = which("nvcc") or "/usr/local/cuda/bin/nvcc"
+
+    try:
+        output = subprocess.run(
+            [nvcc, "--version"], capture_output=True, text=True, timeout=60
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"release (\d+)\.", output)
+    return int(match.group(1)) if match else None
+
+
 def get_user_choice(question: str, options_dict: dict):
     """
     Gets user input in a commandline script.
@@ -95,30 +118,41 @@ def get_install_features(lib_name: str = None):
     """Fetches the appropriate requirements file depending on the GPU"""
     install_features = None
     possible_features = ["cu12", "cu13", "rocm"]
+    is_arm = platform.machine().lower() in ("aarch64", "arm64")
 
     if not lib_name:
         has_nvidia = which("nvidia-smi") is not None
         has_amd = platform.system() == "Linux" and pathlib.Path("/dev/kfd").exists()
 
-        if has_nvidia:
+        if has_nvidia and is_arm:
+            # ExLlamaV3 is compiled from source on ARM with the system's nvcc, whose CUDA
+            # major version has to match torch's
+            lib_name = "cu12" if nvcc_cuda_major() == 12 else "cu13"
+            print(f"Auto-detected NVIDIA GPU on ARM. Using CUDA {lib_name[2:]}.x backend.")
+        elif has_nvidia:
             lib_name = "cu12"
             print("Auto-detected NVIDIA GPU. Using CUDA 12.x backend.")
-        elif has_amd:
+        elif has_amd and not is_arm:
             lib_name = "rocm"
             print("Auto-detected AMD GPU. Using the ROCm backend.")
         else:
             gpu_lib_choices = {
                 "A": {"pretty": "NVIDIA Cuda 12.x", "internal": "cu12"},
                 "B": {"pretty": "NVIDIA Cuda 13.x", "internal": "cu13"},
-                "C": {"pretty": "AMD ROCm (RDNA2 to RDNA4, Linux)", "internal": "rocm"},
             }
+            if not is_arm:
+                gpu_lib_choices["C"] = {
+                    "pretty": "AMD ROCm (RDNA2 to RDNA4, Linux)",
+                    "internal": "rocm",
+                }
             print(
                 "WARNING: Auto-detection failed. "
                 "Please ensure you have an NVIDIA GPU (with nvidia-smi) "
                 "or an AMD GPU (with /dev/kfd) installed."
             )
+            default_choice = "Cuda 13.x (B)" if is_arm else "Cuda 12.x (A)"
             user_input = get_user_choice(
-                "Select your GPU. If you don't know, select Cuda 12.x (A)",
+                f"Select your GPU. If you don't know, select {default_choice}",
                 gpu_lib_choices,
             )
             lib_name = gpu_lib_choices.get(user_input, {}).get("internal")
@@ -126,6 +160,15 @@ def get_install_features(lib_name: str = None):
         # Write to start options
         start_options["gpu_lib"] = lib_name
         print("Saving your choice to start options.")
+
+    if lib_name == "rocm" and is_arm:
+        print(
+            "WARN: The ROCm dependencies are only available for x86_64 Linux. "
+            "Skipping GPU-specific dependencies.\n"
+            "WARN: Please remove the `gpu_lib` key from start_options.json and restart "
+            "if you want to change your selection."
+        )
+        return
 
     if lib_name == "rocm" and not start_options.get("rocm_targets"):
         targets = detect_amd_gpu_targets()
@@ -148,6 +191,12 @@ def get_install_features(lib_name: str = None):
     if lib_name and lib_name in possible_features:
         print(f"Using {lib_name} dependencies from your preferences.")
         install_features = lib_name
+
+        if lib_name == "cu13" and sys.version_info < (3, 12):
+            print(
+                "WARN: The cu13 dependencies need Python 3.12 or newer, this is "
+                f"Python {platform.python_version()}. Torch and ExLlamaV3 won't be installed."
+            )
     else:
         print(
             f"WARN: GPU library {lib_name} not found. "

@@ -157,6 +157,7 @@ model:
   # Options: native, nccl
   # Native is recommended for PCIe GPUs
   # NCCL is recommended for NVLink.
+  # Native needs an x86 CPU. NCCL is used instead on ARM.
   tensor_parallel_backend: native
 
   # Automatically allocate resources to GPUs (default: True).
@@ -177,7 +178,7 @@ model:
 
   # Number of mixture-of-expert layers to offload to CPU inference (default: 0)
   # Only affects MoE models. Set a large value such as 999 to offload all layers
-  # Mutually exclusive with cpu_moe_split_experts.
+  # Mutually exclusive with cpu_moe_split_experts. Needs an x86 CPU.
   cpu_moe_offload_layers:
 
   # Number of routed experts per MoE layer to offload to CPU inference (default: 0).
@@ -185,6 +186,7 @@ model:
   # layers: the coldest experts are kept in system RAM and computed on the CPU, overlapping
   # each layer's own GPU compute, with dynamic placement keeping hot experts in VRAM.
   # Mutually exclusive with cpu_moe_offload_layers; not supported with tensor parallelism.
+  # Needs an x86 CPU.
   cpu_moe_split_experts:
 
   # Worker thread count for CPU MoE inference (default: None).

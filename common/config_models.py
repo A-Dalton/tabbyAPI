@@ -297,7 +297,8 @@ class ModelConfig(BaseConfigModel):
             "Sets a backend type for tensor parallelism. (default: native).\n"
             "Options: native, nccl\n"
             "Native is recommended for PCIe GPUs\n"
-            "NCCL is recommended for NVLink."
+            "NCCL is recommended for NVLink.\n"
+            "Native needs an x86 CPU. NCCL is used instead on ARM."
         ),
     )
     gpu_split_auto: Optional[bool] = Field(
@@ -330,7 +331,7 @@ class ModelConfig(BaseConfigModel):
         description=(
             "Number of mixture-of-expert layers to offload to CPU inference (default: 0)\n"
             "Only affects MoE models. Set a large value such as 999 to offload all layers\n"
-            "Mutually exclusive with cpu_moe_split_experts."
+            "Mutually exclusive with cpu_moe_split_experts. Needs an x86 CPU."
         ),
     )
     cpu_moe_split_experts: Optional[int] = Field(
@@ -342,7 +343,7 @@ class ModelConfig(BaseConfigModel):
             "kept in system RAM and computed on the CPU, overlapping each\n"
             "layer's own GPU compute, with dynamic placement keeping hot\n"
             "experts in VRAM. Mutually exclusive with cpu_moe_offload_layers;\n"
-            "not supported with tensor parallelism."
+            "not supported with tensor parallelism. Needs an x86 CPU."
         ),
     )
     cpu_moe_threads: Optional[int] = Field(
